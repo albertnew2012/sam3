@@ -71,6 +71,8 @@ class Mlp(nn.Module):
         x = addmm_act(type(self.act), self.fc1, x)
         x = self.drop1(x)
         x = self.norm(x)
+        if x.dtype != self.fc2.weight.dtype and not torch.is_autocast_enabled():
+            x = x.to(self.fc2.weight.dtype)
         x = self.fc2(x)
         x = self.drop2(x)
         return x

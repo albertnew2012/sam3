@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
 # pyre-unsafe
+from contextlib import nullcontext
 from typing import Dict, List
 
 import numpy as np
@@ -18,6 +19,17 @@ class Sam3Processor:
         self.model = model
         self.resolution = resolution
         self.device = device
+        device_type = torch.device(device).type
+        if device_type == "cuda":
+            autocast_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+            self.autocast_context = torch.autocast(
+                device_type="cuda", dtype=autocast_dtype
+            )
+        else:
+            self.autocast_context = nullcontext()
+        self.autocast_context.__enter__()
         self.transform = v2.Compose(
             [
                 v2.ToDtype(torch.uint8, scale=True),
