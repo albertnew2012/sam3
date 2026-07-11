@@ -2,6 +2,8 @@
 
 # pyre-unsafe
 
+import random
+
 import cv2
 import numpy as np
 import pycocotools.mask as mask_utils
@@ -12,6 +14,42 @@ from .helpers.zoom_in import render_zoom_in
 
 
 def visualize(
+    input_json: dict,
+    zoom_in_index: int | None = None,
+    mask_alpha: float = 0.15,
+    label_mode: str = "1",
+    font_size_multiplier: float = 1.2,
+    boarder_width_multiplier: float = 0,
+):
+    """Deterministic wrapper around the renderer.
+
+    Mask overlay colors are drawn with ``np.random`` / ``random`` (see
+    ``helpers/color_map.py``). Left unseeded, the SAME masks get DIFFERENT colors
+    on every call, which changes the rendered image and makes any downstream VLM
+    judgement non-reproducible across runs (especially for color queries like
+    "blue vest", where the random tint corrupts the perceived color). We seed both
+    RNGs from a fixed value so identical masks always render identically, and
+    save/restore the global RNG state so nothing else is affected.
+    """
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+    np.random.seed(0)
+    random.seed(0)
+    try:
+        return _visualize_impl(
+            input_json,
+            zoom_in_index,
+            mask_alpha,
+            label_mode,
+            font_size_multiplier,
+            boarder_width_multiplier,
+        )
+    finally:
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+
+
+def _visualize_impl(
     input_json: dict,
     zoom_in_index: int | None = None,
     mask_alpha: float = 0.15,

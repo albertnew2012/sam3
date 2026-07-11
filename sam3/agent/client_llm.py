@@ -3,10 +3,28 @@
 # pyre-unsafe
 
 import base64
+import json
 import os
 from typing import Any, Optional
 
-from openai import OpenAI
+import requests
+
+
+def _wrap_structured(content: str, wrap: str) -> str:
+    """Structured-decoding path: the model was constrained to return a JSON object
+    (see agent_core._tool_structured / _VERDICT_STRUCTURED). Convert that object into
+    the plain ``<tool>...</tool>`` or ``<verdict>...</verdict>`` string the agent's
+    parser expects, so the rest of the agent is unchanged.
+
+    Tool schema: {"reasoning": str, "tool": {"name": ..., "parameters": ...}}
+    Verdict schema: {"reasoning": str, "verdict": "Accept"|"Reject"}
+    """
+    obj = json.loads(content)
+    if wrap == "tool":
+        tool = obj.get("tool", obj)  # tolerate a bare tool object too
+        return "<tool>" + json.dumps(tool) + "</tool>"
+    # wrap == "verdict"
+    return "<verdict>" + obj["verdict"] + "</verdict>"
 
 
 def get_image_base64_and_mime(image_path):
@@ -39,15 +57,23 @@ def send_generate_request(
     model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
     api_key=None,
     max_tokens=4096,
+    structured=None,
+    wrap=None,
 ):
     """
-    Sends a request to the OpenAI-compatible API endpoint using the OpenAI client library.
+    Sends a request to the OpenAI-compatible API endpoint via a plain HTTP POST.
 
     Args:
         server_url (str): The base URL of the server, e.g. "http://127.0.0.1:8000"
         messages (list): A list of message dicts, each containing role and content.
         model (str): The model to use for generation (default: "llama-4")
         max_tokens (int): Maximum number of tokens to generate (default: 4096)
+        structured (dict|None): Extra request fields to force structured decoding,
+            e.g. {"structured_outputs": {"json": <schema>}}. Used to make a weaker
+            local model (Qwen3-VL-8B) reliably emit a valid tool call / verdict
+            instead of free-form prose. Merged verbatim into the request body.
+        wrap (str|None): "tool" or "verdict". When set, the model's JSON response is
+            converted back into the ``<tool>``/``<verdict>`` string the agent parses.
 
     Returns:
         str: The generated response text from the server.
@@ -102,25 +128,39 @@ def send_generate_request(
             processed_message["content"] = processed_content
         processed_messages.append(processed_message)
 
-    # Create OpenAI client with custom base URL
-    client = OpenAI(api_key=api_key, base_url=server_url)
+    # Plain stateless HTTP POST to the OpenAI-compatible endpoint (e.g. the local
+    # vLLM server hosting Qwen). No OpenAI() client object, no persistent
+    # connection pool -- each call opens and closes its own connection, so nothing
+    # can accumulate across the agent's many per-round / per-mask calls.
+    url = server_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": processed_messages,
+        "max_completion_tokens": max_tokens,
+        "n": 1,
+    }
+    if structured:
+        # e.g. {"structured_outputs": {"json": <schema>}} for vLLM 0.24+.
+        payload.update(structured)
 
     try:
         print(f"🔍 Calling model {model}...")
-        response = client.chat.completions.create(
-            model=model,
-            messages=processed_messages,
-            max_completion_tokens=max_tokens,
-            n=1,
-        )
-        # print(f"Received response: {response.choices[0].message}")
+        with requests.post(url, headers=headers, json=payload, timeout=600) as resp:
+            resp.raise_for_status()
+            data = resp.json()
 
-        # Extract the response content
-        if response.choices and len(response.choices) > 0:
-            return response.choices[0].message.content
-        else:
-            print(f"Unexpected response format: {response}")
+        choices = data.get("choices")
+        if not choices:
+            print(f"Unexpected response format: {data}")
             return None
+        content = choices[0]["message"]["content"]
+        if wrap:
+            # Convert the constrained JSON back into the <tool>/<verdict> string.
+            content = _wrap_structured(content, wrap)
+        return content
 
     except Exception as e:
         print(f"Request failed: {e}")

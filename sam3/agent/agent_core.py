@@ -14,6 +14,191 @@ from .client_sam3 import call_sam_service
 from .viz import visualize
 
 
+# ---------------------------------------------------------------------------
+# Structured-decoding schemas (used to force a weaker local model, e.g.
+# Qwen3-VL-8B, to emit a valid tool call / verdict instead of free-form prose
+# that the parser then rejects). The model still writes free "reasoning" first,
+# so decision quality is preserved; only the OUTPUT SHAPE is constrained.
+# These are passed to send_generate_request(..., structured=..., wrap=...); a
+# frontier model that already follows the protocol can ignore them (pass None).
+# ---------------------------------------------------------------------------
+_TOOL_VARIANTS = {
+    "segment_phrase": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"const": "segment_phrase"},
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"text_prompt": {"type": "string"}},
+                "required": ["text_prompt"],
+            },
+        },
+        "required": ["name", "parameters"],
+    },
+    "examine_each_mask": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"const": "examine_each_mask"},
+            "parameters": {"type": "object", "additionalProperties": False},
+        },
+        "required": ["name", "parameters"],
+    },
+    "select_masks_and_return": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"const": "select_masks_and_return"},
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "final_answer_masks": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    }
+                },
+                "required": ["final_answer_masks"],
+            },
+        },
+        "required": ["name", "parameters"],
+    },
+    "report_no_mask": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"const": "report_no_mask"},
+            "parameters": {"type": "object", "additionalProperties": False},
+        },
+        "required": ["name", "parameters"],
+    },
+}
+
+
+def _tool_structured(allowed_names):
+    """Build a vLLM structured-outputs spec forcing {reasoning, tool} where `tool`
+    is one of the tool schemas valid in the current state. temperature=0 makes the
+    agent's control-flow decisions reproducible."""
+    return {
+        "temperature": 0,
+        "structured_outputs": {
+            "json": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "reasoning": {"type": "string"},
+                    "tool": {"anyOf": [_TOOL_VARIANTS[n] for n in allowed_names]},
+                },
+                "required": ["reasoning", "tool"],
+            }
+        },
+    }
+
+
+_VERDICT_STRUCTURED = {
+    "temperature": 0,
+    "structured_outputs": {
+        "json": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "reasoning": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["Accept", "Reject"]},
+            },
+            "required": ["reasoning", "verdict"],
+        }
+    },
+}
+
+
+# Structured spec for the focused selection step (see _focused_select_masks): free-form
+# step-by-step reasoning, then the list of matching mask numbers. Kept deliberately
+# MINIMAL -- an earlier two-stage schema (forcing an intermediate "attribute-matching"
+# list) actually made the 8B mis-parse "leftmost X wearing Y" as (leftmost) AND (Y) and
+# return []. Plain enumerate-then-answer composes such queries correctly and stably
+# (verified 8/8). temperature=0 for reproducibility.
+_SELECT_STRUCTURED = {
+    "temperature": 0,
+    "structured_outputs": {
+        "json": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "reasoning": {"type": "string"},
+                "final_answer_masks": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["reasoning", "final_answer_masks"],
+        }
+    },
+}
+
+
+def _focused_select_masks(
+    query, raw_image_path, masks_image_path, num_masks, selection_system_prompt, gen_fn
+):
+    """Grounding done well on a weak model: instead of trusting the mask indices the
+    model chose while buried under the 66 KB agent protocol, re-ask the *same* model
+    the single focused question -- "which numbered mask(s) match this query?" -- with
+    a small, generic, query-agnostic prompt and step-by-step structured reasoning.
+
+    Two images are provided: the RAW image (to judge true colors/appearance, free of
+    overlay tints) and the numbered-mask image (to identify which number is which).
+    This matters because the overlay colors are random; judging a color attribute
+    ("blue vest") off the tinted image is what made results flip run-to-run.
+
+    This is the analogue of the per-mask verdict step (which already uses its own
+    small prompt + the raw image). It is NOT specialized to any example: `query` is
+    whatever the user asked, and the prompt names no specific object/attribute/relation.
+
+    Returns a list of 1-based mask numbers, or None if the call/parse failed (the
+    caller then falls back to the model's inline choice).
+    """
+    messages = [
+        {"role": "system", "content": selection_system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"The user query is: '{query}'."},
+                {
+                    "type": "text",
+                    "text": (
+                        "Image 1 -- the RAW input image. Judge each object's true "
+                        "color and appearance from THIS image; it has no overlays."
+                    ),
+                },
+                {"type": "image", "image": raw_image_path},
+                {
+                    "type": "text",
+                    "text": (
+                        f"Image 2 -- the SAME scene with {num_masks} candidate mask(s) "
+                        f"outlined and labeled 1 to {num_masks}. Use it ONLY to see which "
+                        f"number covers which object. The overlay colors are ARBITRARY "
+                        f"and must NOT be used to judge an object's real color."
+                    ),
+                },
+                {"type": "image", "image": masks_image_path},
+                {
+                    "type": "text",
+                    "text": "Decide which mask number(s) the query refers to.",
+                },
+            ],
+        },
+    ]
+    raw = gen_fn(messages, structured=_SELECT_STRUCTURED)
+    if raw is None:
+        return None
+    try:
+        obj = json.loads(raw)
+        print(f"🎯 Focused-selection reasoning: {obj.get('reasoning', '')[:300]}")
+        print(f"   -> final_answer_masks: {obj.get('final_answer_masks')}")
+        return obj["final_answer_masks"]
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"Focused selection could not be parsed ({e}); raw={raw!r}")
+        return None
+
+
 def save_debug_messages(messages_list, debug, debug_folder_path, debug_jsonl_path):
     """Save messages to debug jsonl file if debug is enabled"""
     if debug and debug_jsonl_path:
@@ -154,6 +339,9 @@ def agent_inference(
     ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH = os.path.join(
         current_dir, "system_prompts/system_prompt_iterative_checking.txt"
     )
+    SELECTION_SYSTEM_PROMPT_PATH = os.path.join(
+        current_dir, "system_prompts/system_prompt_selection.txt"
+    )
     # init variables
     PATH_TO_LATEST_OUTPUT_JSON = ""
     LATEST_SAM3_TEXT_PROMPT = ""
@@ -177,6 +365,8 @@ def agent_inference(
         system_prompt = f.read().strip()
     with open(ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH, "r") as f:
         iterative_checking_system_prompt = f.read().strip()
+    with open(SELECTION_SYSTEM_PROMPT_PATH, "r") as f:
+        selection_system_prompt = f.read().strip()
 
     # Construct the initial message list
     messages = [
@@ -198,13 +388,19 @@ def agent_inference(
     print("\n\n")
     print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
     print("\n\n")
-    generated_text = send_generate_request(messages)
+    # Round 1: force segmentation. "No mask" is never a valid FIRST action -- you
+    # can't know nothing matches without asking SAM3 first. (report_no_mask becomes
+    # available again only after a segmentation attempt actually returns 0 masks.)
+    generated_text = send_generate_request(
+        messages,
+        structured=_tool_structured(["segment_phrase"]),
+        wrap="tool",
+    )
     print(f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n")
     while generated_text is not None:
         save_debug_messages(messages, debug, debug_folder_path, debug_jsonl_path)
-        assert (
-            "<tool>" in generated_text,
-            f"Generated text does not contain <tool> tag: {generated_text}",
+        assert "<tool>" in generated_text, (
+            f"Generated text does not contain <tool> tag: {generated_text}"
         )
         generated_text = generated_text.split("</tool>", 1)[0] + "</tool>"
         tool_call_json_str = (
@@ -355,7 +551,9 @@ def agent_inference(
                     },
                 ]
                 checking_generated_text = send_generate_request(
-                    iterative_checking_messages
+                    iterative_checking_messages,
+                    structured=_VERDICT_STRUCTURED,
+                    wrap="verdict",
                 )
 
                 # Process the generated text to determine if the mask should be kept or rejected
@@ -456,7 +654,32 @@ def agent_inference(
             current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
 
             assert list(tool_call["parameters"].keys()) == ["final_answer_masks"]
-            masks_to_keep = tool_call["parameters"]["final_answer_masks"]
+            inline_choice = tool_call["parameters"]["final_answer_masks"]
+
+            # Delegate the actual grounding to the focused, query-agnostic selection
+            # step rather than trusting the indices the model chose while buried under
+            # the 66 KB agent protocol. Render the current candidates (numbered) and
+            # ask the single focused question "which mask(s) match this query?".
+            num_masks = len(current_outputs["pred_masks"])
+            selection_input_img = os.path.join(
+                sam_output_dir, "focused_selection_input.png"
+            )
+            visualize(current_outputs).save(selection_input_img)
+            focused_choice = _focused_select_masks(
+                initial_text_prompt,
+                img_path,
+                selection_input_img,
+                num_masks,
+                selection_system_prompt,
+                send_generate_request,
+            )
+            masks_to_keep = (
+                focused_choice if focused_choice is not None else inline_choice
+            )
+            print(
+                f"Selected masks (focused={focused_choice}, inline={inline_choice})"
+                f" -> {masks_to_keep}"
+            )
 
             # Keep only valid mask indices, remove duplicates, and preserve deterministic ascending order
             available_masks = set(range(1, len(current_outputs["pred_masks"]) + 1))
@@ -546,7 +769,26 @@ def agent_inference(
         print("\n\n")
         print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
         print("\n\n")
-        generated_text = send_generate_request(messages)
+        # Restrict the tool set to what is valid in the current state: before any
+        # masks exist only (re-)segmentation / giving up make sense; once masks
+        # exist the model may examine, select, re-segment, or report none.
+        if PATH_TO_LATEST_OUTPUT_JSON == "":
+            allowed_tools = ["segment_phrase", "report_no_mask"]
+        else:
+            # Candidates exist: engage with them (examine / select) or re-segment.
+            # report_no_mask is dropped here so the model can't lazily give up while
+            # candidates are on the table; a true "no match" still emerges when the
+            # focused selection step returns an empty list after real analysis.
+            allowed_tools = [
+                "segment_phrase",
+                "examine_each_mask",
+                "select_masks_and_return",
+            ]
+        generated_text = send_generate_request(
+            messages,
+            structured=_tool_structured(allowed_tools),
+            wrap="tool",
+        )
         print(
             f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
         )

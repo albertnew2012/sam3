@@ -34,12 +34,7 @@ def run_single_image_inference(
     base_filename = f"{image_basename}_{prompt_for_filename}_agent_{llm_name}"
     output_json_path = os.path.join(output_dir, f"{base_filename}_pred.json")
     output_image_path = os.path.join(output_dir, f"{base_filename}_pred.png")
-    agent_history_path = os.path.join(output_dir, f"{base_filename}_history.json")
-
-    # Check if output already exists and skip
-    if os.path.exists(output_json_path):
-        print(f"Output JSON {output_json_path} already exists. Skipping.")
-        return
+    agent_history_path = os.path.join(output_dir, f"{base_filename}_history.jsonl")
 
     print(f"{'-' * 30} Starting SAM 3 Agent Session... {'-' * 30} ")
     agent_history, final_output_dict, rendered_final_output = agent_inference(
@@ -57,7 +52,10 @@ def run_single_image_inference(
 
     # Save outputs
     json.dump(final_output_dict, open(output_json_path, "w"), indent=4)
-    json.dump(agent_history, open(agent_history_path, "w"), indent=4)
+    # Save the turn-by-turn conversation as JSONL: one message (turn) per line.
+    with open(agent_history_path, "w") as f:
+        for message in agent_history:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
     rendered_final_output.save(output_image_path)
 
     print(f"\n✅ Successfully processed single image!")
